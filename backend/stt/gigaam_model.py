@@ -98,15 +98,39 @@ class GigaAMModel:
 
     def load_model(self, revision: str = MODEL_REVISION):
         if self._model is None:
+            model_path = os.environ.get("GIGAAM_MODEL_PATH", "ai-sage/GigaAM-v3")
             print(f"Loading GigaAM-v3 model ({revision})...")
-            self._model = AutoModel.from_pretrained(
-                "ai-sage/GigaAM-v3",
-                revision=revision,
-                trust_remote_code=True,
-                torch_dtype=torch.float32,
-                device_map="cpu"
-            )
-            print("Model loaded successfully!")
+
+            if model_path == "ai-sage/GigaAM-v3":
+                try:
+                    self._model = AutoModel.from_pretrained(
+                        model_path,
+                        revision=revision,
+                        trust_remote_code=True,
+                        torch_dtype=torch.float32,
+                        device_map="cpu",
+                        local_files_only=True
+                    )
+                    print("Model loaded from cache!")
+                except EnvironmentError:
+                    print("Model not in cache, downloading from HuggingFace...")
+                    os.environ["HF_HUB_DOWNLOAD_TIMEOUT"] = "120"
+                    self._model = AutoModel.from_pretrained(
+                        model_path,
+                        revision=revision,
+                        trust_remote_code=True,
+                        torch_dtype=torch.float32,
+                        device_map="cpu"
+                    )
+                    print("Model downloaded and loaded!")
+            else:
+                self._model = AutoModel.from_pretrained(
+                    model_path,
+                    trust_remote_code=True,
+                    torch_dtype=torch.float32,
+                    device_map="cpu"
+                )
+                print("Model loaded from local path!")
         return self._model
 
     def transcribe(self, audio_path: str) -> str:

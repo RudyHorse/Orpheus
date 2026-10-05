@@ -21,3 +21,8 @@ accelerate>=0.20.0
 # 
 # GPU support (optional):
 #   pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu124
+
+# Whisper Small - uses transformers pipeline (no extra package needed)
+
+# Ollama LLM enhancement
+httpx>=0.28.0
