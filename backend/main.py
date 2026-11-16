@@ -1,8 +1,9 @@
 import asyncio
-import csv
 import json
 import logging
 import os
+import sqlite3
+import statistics
 import subprocess
 import sys
 import tempfile
@@ -33,14 +34,11 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
 from stt.gigaam_model import gigaam_model, set_num_threads
-from stt.whisper_model import whisper_small_model, whisper_medium_model
 from stt.gigaam_multilingual_model import gigaam_multilingual_model
 
 AVAILABLE_MODELS = {
     "GigaAM-v3": gigaam_model,
     "GigaAM Multilingual": gigaam_multilingual_model,
-    "Whisper Small": whisper_small_model,
-    "Whisper Medium": whisper_medium_model,
 }
 
 def get_model(name: str = "GigaAM-v3"):
@@ -72,8 +70,9 @@ CHUNK_OVERLAP_SEC = 1
 OUTPUT_DIR = Path("./output")
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
-LOG_FILE = Path("orphrus.log")
-LOG_HEADER = ["number", "date", "file_name", "duration", "file_size", "run_time", "num_chunks", "cpu_cores", "model"]
+LOG_DB = Path(__file__).parent / "orphrus.db"
+LOG_LEGACY_FILE = Path(__file__).parent / "orphrus.log"
+LOG_COLUMNS = ["number", "date", "file_name", "duration", "file_size", "run_time", "num_chunks", "cpu_cores", "model"]
 
 stop_events = {}
 transcription_locks = {}
@@ -81,21 +80,93 @@ transcription_progress = {}
 batch_progress = {}
 batch_results = {}
 
-if not LOG_FILE.exists():
-    with open(LOG_FILE, 'w', newline='', encoding='utf-8') as f:
-        writer = csv.writer(f, delimiter='\t')
-        writer.writerow(LOG_HEADER)
-else:
-    # Convert existing log file to UTF-8 if not already
-    for enc in ('utf-8', 'cp1251', 'latin-1'):
-        try:
-            with open(LOG_FILE, 'r', encoding=enc) as f:
-                content = f.read()
-            with open(LOG_FILE, 'w', newline='', encoding='utf-8') as f:
-                f.write(content)
-            break
-        except UnicodeDecodeError:
-            continue
+
+def _get_db():
+    conn = sqlite3.connect(LOG_DB)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def init_log_db():
+    conn = _get_db()
+    try:
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS logs (
+                number INTEGER PRIMARY KEY,
+                date TEXT,
+                file_name TEXT,
+                duration TEXT,
+                file_size TEXT,
+                run_time TEXT,
+                num_chunks INTEGER,
+                cpu_cores INTEGER,
+                model TEXT
+            )
+        """)
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def migrate_legacy_log():
+    if not LOG_LEGACY_FILE.exists():
+        return
+    conn = _get_db()
+    try:
+        cur = conn.execute("SELECT COUNT(*) FROM logs")
+        if cur.fetchone()[0] > 0:
+            return
+        for enc in ('utf-8', 'cp1251', 'latin-1'):
+            try:
+                with open(LOG_LEGACY_FILE, 'r', encoding=enc) as f:
+                    lines = f.readlines()
+                break
+            except UnicodeDecodeError:
+                continue
+        else:
+            return
+        for line in lines:
+            line = line.strip('\r\n')
+            if not line or line.lower().startswith('number'):
+                continue
+            parts = [p for p in line.split('\t')]
+            try:
+                number = int(parts[0])
+                date = parts[1]
+                file_name = parts[2].strip()
+                # file_size is the field containing 'Mb'
+                size_idx = next(i for i, p in enumerate(parts) if 'Mb' in p)
+                file_size = parts[size_idx]
+                # duration is the time field right after file_name (skip empties)
+                duration = next((p for p in parts[3:size_idx] if p.strip()), "")
+                # run_time is the HH:MM:SS field after file_size
+                run_time = next((p for p in parts[size_idx + 1:] if p.count(':') >= 2), "")
+                # model is an optional trailing non-integer column
+                model = ""
+                tail = [p for p in parts[size_idx + 1:] if p.strip()]
+                if tail and not tail[-1].strip().isdigit():
+                    model = tail[-1].strip()
+                    tail = tail[:-1]
+                nums = [int(p) for p in tail if p.strip().isdigit()]
+                if len(nums) < 2:
+                    continue
+                num_chunks = nums[-2]
+                cpu_cores = nums[-1]
+                conn.execute(
+                    "INSERT OR IGNORE INTO logs (number, date, file_name, duration, file_size, run_time, num_chunks, cpu_cores, model) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (number, date, file_name, duration, file_size, run_time, num_chunks, cpu_cores, model),
+                )
+            except (ValueError, IndexError, StopIteration):
+                continue
+        conn.commit()
+        logger.info("Migrated legacy log into SQLite")
+    finally:
+        conn.close()
+
+
+init_log_db()
+migrate_legacy_log()
 
 
 class TranscriptionResponse(BaseModel):
@@ -166,37 +237,50 @@ class TranscribeChunksResponse(BaseModel):
     error: Optional[str] = None
 
 
-SUPPORTED_FORMATS = ('.mp3', '.wav', '.flac', '.m4a', '.ogg', '.aiff', '.aif', '.caf', '.mp4')
+SUPPORTED_FORMATS = ('.mp3', '.wav', '.flac', '.m4a', '.ogg', '.aiff', '.aif', '.caf', '.mp4', '.webm')
+
+
+def _format_seconds(total_seconds):
+    total_seconds = int(total_seconds or 0)
+    hours = total_seconds // 3600
+    mins = (total_seconds % 3600) // 60
+    secs = total_seconds % 60
+    return f"{hours}:{mins:02d}:{secs:02d}"
 
 
 def get_log_count():
-    if not LOG_FILE.exists():
-        return 0
-    for enc in ('utf-8', 'cp1251', 'latin-1'):
-        try:
-            with open(LOG_FILE, 'r', encoding=enc) as f:
-                lines = [l for l in f.readlines() if l.strip() and not l.startswith('number')]
-                return len(lines)
-        except UnicodeDecodeError:
-            continue
-    return 0
+    conn = _get_db()
+    try:
+        cur = conn.execute("SELECT COUNT(*) FROM logs")
+        return cur.fetchone()[0]
+    finally:
+        conn.close()
 
 
 def save_log_entry(file_name, duration, file_size_mb, run_time, num_chunks, cpu_cores, model_name="GigaAM-v3"):
-    number = get_log_count() + 1
-    date = datetime.now().strftime('%Y-%m-%d')
-    hours = int(duration // 3600)
-    mins = int((duration % 3600) // 60)
-    secs = int(duration % 60)
-    duration_str = f"{hours}:{mins:02d}:{secs:02d}" if hours > 0 else f"{mins:02d}:{secs:02d}"
-    hours_r = int(run_time // 3600)
-    mins_r = int((run_time % 3600) // 60)
-    secs_r = int(run_time % 60)
-    runtime_formatted = f"{hours_r:02d}:{mins_r:02d}:{secs_r:02d}"
-    file_size_str = f"{file_size_mb:.1f} Mb"
-    with open(LOG_FILE, 'a', newline='', encoding='utf-8') as f:
-        writer = csv.writer(f, delimiter='\t')
-        writer.writerow([number, date, file_name, duration_str, file_size_str, runtime_formatted, num_chunks, cpu_cores, model_name])
+    conn = _get_db()
+    try:
+        cur = conn.execute("SELECT MAX(number) FROM logs")
+        row = cur.fetchone()
+        number = (row[0] or 0) + 1
+        date = datetime.now().strftime('%Y-%m-%d')
+        hours = int(duration // 3600)
+        mins = int((duration % 3600) // 60)
+        secs = int(duration % 60)
+        duration_str = f"{hours}:{mins:02d}:{secs:02d}" if hours > 0 else f"{mins:02d}:{secs:02d}"
+        hours_r = int(run_time // 3600)
+        mins_r = int((run_time % 3600) // 60)
+        secs_r = int(run_time % 60)
+        runtime_formatted = f"{hours_r:02d}:{mins_r:02d}:{secs_r:02d}"
+        file_size_str = f"{file_size_mb:.1f} Mb"
+        conn.execute(
+            "INSERT INTO logs (number, date, file_name, duration, file_size, run_time, num_chunks, cpu_cores, model) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (number, date, file_name, duration_str, file_size_str, runtime_formatted, num_chunks, cpu_cores, model_name),
+        )
+        conn.commit()
+    finally:
+        conn.close()
     logger.info(f"Log entry #{number} saved")
 
 
@@ -319,6 +403,109 @@ async def root():
     return {"message": "Orpheus API", "version": "1.0.0"}
 
 
+@app.get("/api/logs")
+async def list_logs():
+    conn = _get_db()
+    try:
+        cur = conn.execute("SELECT * FROM logs ORDER BY number DESC")
+        rows = cur.fetchall()
+        return {"logs": [dict(r) for r in rows]}
+    finally:
+        conn.close()
+
+
+@app.delete("/api/logs/{number}")
+async def delete_log(number: int):
+    conn = _get_db()
+    try:
+        cur = conn.execute("DELETE FROM logs WHERE number = ?", (number,))
+        conn.commit()
+        if cur.rowcount == 0:
+            return {"success": False, "error": "Log entry not found"}
+        return {"success": True}
+    finally:
+        conn.close()
+
+
+def _parse_duration_seconds(value):
+    if not value:
+        return 0
+    value = str(value).strip()
+    parts = value.split(':')
+    try:
+        parts = [int(p) for p in parts if p.strip() != '']
+        if len(parts) == 1:
+            return parts[0]
+        if len(parts) == 2:
+            return parts[0] * 60 + parts[1]
+        if len(parts) == 3:
+            return parts[0] * 3600 + parts[1] * 60 + parts[2]
+    except (ValueError, TypeError):
+        return 0
+    return 0
+
+
+@app.get("/api/analytics")
+async def get_analytics():
+    conn = _get_db()
+    try:
+        cur = conn.execute("SELECT duration, run_time, cpu_cores FROM logs")
+        rows = cur.fetchall()
+        total_files = len(rows)
+        durations = [_parse_duration_seconds(r["duration"]) for r in rows]
+        runtimes = [_parse_duration_seconds(r["run_time"]) for r in rows]
+        total_duration = sum(durations)
+        total_runtime = sum(runtimes)
+
+        avg_runtime = statistics.mean(runtimes) if runtimes else 0
+        median_runtime = statistics.median(runtimes) if runtimes else 0
+        avg_duration = statistics.mean(durations) if durations else 0
+        median_duration = statistics.median(durations) if durations else 0
+
+        # runs grouped by cpu_cores
+        runs_by_cores = {}
+        for r in rows:
+            cores = r["cpu_cores"]
+            runs_by_cores[cores] = runs_by_cores.get(cores, 0) + 1
+
+        # average run time (seconds) per 1 minute of audio, grouped by cpu_cores
+        per_core_rt = {}
+        per_core_cnt = {}
+        for r in rows:
+            cores = r["cpu_cores"]
+            dur = _parse_duration_seconds(r["duration"])
+            rt = _parse_duration_seconds(r["run_time"])
+            if dur > 0:
+                per_min = rt / (dur / 60.0)
+                per_core_rt[cores] = per_core_rt.get(cores, 0) + per_min
+                per_core_cnt[cores] = per_core_cnt.get(cores, 0) + 1
+
+        avg_per_min_by_cores = {
+            str(cores): round(per_core_rt[cores] / per_core_cnt[cores], 2)
+            for cores in per_core_rt
+        }
+
+        return {
+            "total_files": total_files,
+            "total_duration": total_duration,
+            "total_duration_formatted": _format_seconds(total_duration),
+            "total_runtime": total_runtime,
+            "total_runtime_formatted": _format_seconds(total_runtime),
+            "avg_runtime": round(avg_runtime, 2),
+            "avg_runtime_formatted": _format_seconds(avg_runtime),
+            "median_runtime": round(median_runtime, 2),
+            "median_runtime_formatted": _format_seconds(median_runtime),
+            "avg_duration": round(avg_duration, 2),
+            "avg_duration_formatted": _format_seconds(avg_duration),
+            "median_duration": round(median_duration, 2),
+            "median_duration_formatted": _format_seconds(median_duration),
+            "runs_by_cores": runs_by_cores,
+            "avg_per_min_by_cores": avg_per_min_by_cores,
+        }
+    finally:
+        conn.close()
+
+
 @app.get("/api/model-info", response_model=ModelInfoResponse)
 async def get_model_info():
     info = gigaam_model.get_model_info()
@@ -331,8 +518,6 @@ async def list_models():
         "models": [
             {"id": "GigaAM-v3", "name": "GigaAM-v3", "loaded": gigaam_model._model is not None},
             {"id": "GigaAM Multilingual", "name": "GigaAM Multilingual", "loaded": gigaam_multilingual_model._model is not None},
-            {"id": "Whisper Small", "name": "Whisper Small", "loaded": whisper_small_model._pipeline is not None},
-            {"id": "Whisper Medium", "name": "Whisper Medium", "loaded": whisper_medium_model._pipeline is not None},
         ]
     }
 

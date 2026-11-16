@@ -3,6 +3,43 @@ import { useState, useEffect, useRef, useCallback } from 'react'
 const API_BASE = ''
 const SUPPORTED_FORMATS = '.mp3,.wav,.flac,.m4a,.ogg,.aiff,.aif,.caf,.mp4,audio/*'
 
+function BarChart({ title, data, unit, valueFormatter }) {
+  const entries = Object.entries(data || {})
+    .map(([k, v]) => ({ label: k, value: v }))
+    .sort((a, b) => Number(a.label) - Number(b.label))
+
+  if (entries.length === 0) {
+    return (
+      <div className="bar-chart-card">
+        <div className="bar-chart-title">{title}</div>
+        <div className="empty-state">No data yet.</div>
+      </div>
+    )
+  }
+
+  const maxValue = Math.max(...entries.map(e => e.value))
+
+  return (
+    <div className="bar-chart-card">
+      <div className="bar-chart-title">{title}</div>
+      <div className="bar-chart">
+        {entries.map(e => (
+          <div key={e.label} className="bar-col">
+            <div className="bar-value">{valueFormatter(e.value)}</div>
+            <div className="bar-track">
+              <div
+                className="bar-fill"
+                style={{ height: maxValue > 0 ? `${(e.value / maxValue) * 100}%` : '0%' }}
+              />
+            </div>
+            <div className="bar-label">{e.label} core{e.label === '1' ? '' : 's'}</div>
+          </div>
+        ))}
+      </div>
+    </div>
+  )
+}
+
 function App() {
   const [inputPath, setInputPath] = useState('')
   const [outputPath, setOutputPath] = useState('')
@@ -12,8 +49,9 @@ function App() {
   const [isConverting, setIsConverting] = useState(false)
   const [isSaving, setIsSaving] = useState(false)
   const [isSavingLlm, setIsSavingLlm] = useState(false)
-  const [showLogs, setShowLogs] = useState(false)
+  const [activeTab, setActiveTab] = useState('transcribe')
   const [logs, setLogs] = useState([])
+  const [analytics, setAnalytics] = useState(null)
   const [error, setError] = useState('')
   const [success, setSuccess] = useState('')
   const [parallelMode, setParallelMode] = useState(false)
@@ -52,6 +90,9 @@ function App() {
   const fileInputRef = useRef(null)
   const outputFileRef = useRef(null)
   const llmFileRef = useRef(null)
+  const mediaRecorderRef = useRef(null)
+  const recordedChunksRef = useRef([])
+  const [isRecording, setIsRecording] = useState(false)
 
   const checkModelStatus = useCallback(async () => {
     try {
@@ -81,6 +122,38 @@ function App() {
   useEffect(() => {
     checkModelStatus()
   }, [checkModelStatus])
+
+  const fetchLogs = useCallback(async () => {
+    try {
+      const resp = await fetch(`${API_BASE}/api/logs`)
+      const data = await resp.json()
+      if (data.logs) setLogs(data.logs)
+    } catch {
+    }
+  }, [])
+
+  const deleteLog = useCallback(async (number) => {
+    try {
+      await fetch(`${API_BASE}/api/logs/${number}`, { method: 'DELETE' })
+      setLogs(prev => prev.filter(l => l.number !== number))
+    } catch {
+    }
+  }, [])
+
+  const fetchAnalytics = useCallback(async () => {
+    try {
+      const resp = await fetch(`${API_BASE}/api/analytics`)
+      const data = await resp.json()
+      setAnalytics(data)
+    } catch {
+    }
+  }, [])
+
+  const switchTab = useCallback(async (tab) => {
+    setActiveTab(tab)
+    if (tab === 'history') await fetchLogs()
+    if (tab === 'analytics') await fetchAnalytics()
+  }, [fetchLogs, fetchAnalytics])
 
   const resetState = useCallback(() => {
     setError('')
@@ -256,6 +329,121 @@ const removeChunk = useCallback((index) => {
     }
   }, [])
 
+  const transcribeSingleFile = useCallback(async (file) => {
+    setIsConverting(true)
+    setError('')
+    setSuccess('')
+    setTranscribedText('')
+    setCurrentChunk(0)
+    setTotalChunks(0)
+    setBatchId(null)
+    setBatchProgress(null)
+    setBatchFileResults([])
+
+    try {
+      const formData = new FormData()
+      formData.append('file', file)
+      formData.append('model', selectedModel)
+
+      const startResponse = await fetch(`${API_BASE}/api/transcribe-start`, {
+        method: 'POST',
+        body: formData,
+      })
+
+      const startData = await startResponse.json()
+
+      if (!startData.success) {
+        setError(startData.error || 'Failed to start transcription')
+        setIsConverting(false)
+        return
+      }
+
+      const tid = startData.transcription_id
+      setTranscriptionId(tid)
+
+      const pollInterval = setInterval(async () => {
+        try {
+          const [progressRes, resultRes] = await Promise.all([
+            fetch(`${API_BASE}/api/progress/${tid}`),
+            fetch(`${API_BASE}/api/transcribe-result/${tid}`),
+          ])
+
+          const progressData = await progressRes.json()
+          const resultData = await resultRes.json()
+
+          if (progressData.total_chunks > 0) {
+            setCurrentChunk(progressData.current_chunk)
+            setTotalChunks(progressData.total_chunks)
+          }
+
+          if (!resultData.error || resultData.error !== 'Transcription in progress') {
+            clearInterval(pollInterval)
+            setIsConverting(false)
+            setTranscriptionId(null)
+
+            if (resultData.success) {
+              setTranscribedText(resultData.text)
+              setAudioInfo(resultData.audio_info)
+              setRuntime(resultData.runtime_formatted)
+            } else {
+              setError(resultData.error || 'Transcription failed')
+            }
+          }
+        } catch (err) {
+          console.error('Polling error:', err)
+        }
+      }, 500)
+    } catch {
+      setError('Failed to connect to server. Make sure the backend is running.')
+      setIsConverting(false)
+    }
+  }, [selectedModel])
+
+  const startRecording = useCallback(async () => {
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true })
+      const mimeType = MediaRecorder.isTypeSupported('audio/webm') ? 'audio/webm' : ''
+      const recorder = mimeType ? new MediaRecorder(stream, { mimeType }) : new MediaRecorder(stream)
+      mediaRecorderRef.current = recorder
+      recordedChunksRef.current = []
+
+      recorder.ondataavailable = (e) => {
+        if (e.data.size > 0) recordedChunksRef.current.push(e.data)
+      }
+
+      recorder.onstop = () => {
+        stream.getTracks().forEach((t) => t.stop())
+        const mime = recorder.mimeType || 'audio/webm'
+        const ext = mime.includes('ogg') ? 'ogg' : 'webm'
+        const blob = new Blob(recordedChunksRef.current, { type: mime })
+        const file = new File([blob], `recording_${Date.now()}.${ext}`, { type: mime })
+        setSelectedFiles([file])
+        setInputPath(file.name)
+        setAudioUrl(URL.createObjectURL(file))
+        setIsPlaying(false)
+        setCurrentTime(0)
+        setSplitMarkers([])
+        setChunksToSend([])
+        setIsRecording(false)
+        transcribeSingleFile(file)
+      }
+
+      recorder.start()
+      setIsRecording(true)
+      setError('')
+      setSuccess('')
+      setTranscribedText('')
+    } catch (err) {
+      setError('Microphone access denied or unavailable: ' + err.message)
+    }
+  }, [transcribeSingleFile])
+
+  const stopRecording = useCallback(() => {
+    if (mediaRecorderRef.current && mediaRecorderRef.current.state !== 'inactive') {
+      mediaRecorderRef.current.stop()
+    }
+  }, [])
+
   const handleConvert = useCallback(async () => {
     if (selectedFiles.length === 0) {
       setError('Please select at least one audio file')
@@ -305,63 +493,7 @@ const removeChunk = useCallback((index) => {
     }
 
     if (selectedFiles.length === 1) {
-      try {
-        const formData = new FormData()
-        formData.append('file', selectedFiles[0])
-        formData.append('model', selectedModel)
-
-        const startResponse = await fetch(`${API_BASE}/api/transcribe-start`, {
-          method: 'POST',
-          body: formData,
-        })
-
-        const startData = await startResponse.json()
-
-        if (!startData.success) {
-          setError(startData.error || 'Failed to start transcription')
-          setIsConverting(false)
-          return
-        }
-
-        const tid = startData.transcription_id
-        setTranscriptionId(tid)
-
-        const pollInterval = setInterval(async () => {
-          try {
-            const [progressRes, resultRes] = await Promise.all([
-              fetch(`${API_BASE}/api/progress/${tid}`),
-              fetch(`${API_BASE}/api/transcribe-result/${tid}`),
-            ])
-
-            const progressData = await progressRes.json()
-            const resultData = await resultRes.json()
-
-            if (progressData.total_chunks > 0) {
-              setCurrentChunk(progressData.current_chunk)
-              setTotalChunks(progressData.total_chunks)
-            }
-
-            if (!resultData.error || resultData.error !== 'Transcription in progress') {
-              clearInterval(pollInterval)
-              setIsConverting(false)
-              setTranscriptionId(null)
-
-              if (resultData.success) {
-                setTranscribedText(resultData.text)
-                setAudioInfo(resultData.audio_info)
-                setRuntime(resultData.runtime_formatted)
-              } else {
-                setError(resultData.error || 'Transcription failed')
-              }
-            }
-          } catch (err) {
-            console.error('Polling error:', err)
-          }
-        }, 500)
-      } catch {
-        setError('Failed to connect to server. Make sure the backend is running.')
-        setIsConverting(false)
-      }
+      await transcribeSingleFile(selectedFiles[0])
       return
     }
 
@@ -441,7 +573,7 @@ const removeChunk = useCallback((index) => {
         setIsConverting(false)
       }
     }
-  }, [selectedFiles, chunksToSend, batchMode])
+  }, [selectedFiles, chunksToSend, batchMode, transcribeSingleFile])
 
   const handleLlmEnhance = useCallback(async () => {
     if (!llmPrompt.trim()) {
@@ -627,8 +759,30 @@ const removeChunk = useCallback((index) => {
             <h1>Orpheus</h1>
           </div>
         </div>
+        <nav className="tab-nav">
+          <button
+            className={`tab-btn ${activeTab === 'transcribe' ? 'active' : ''}`}
+            onClick={() => switchTab('transcribe')}
+          >
+            Transcribe
+          </button>
+          <button
+            className={`tab-btn ${activeTab === 'history' ? 'active' : ''}`}
+            onClick={() => switchTab('history')}
+          >
+            History
+          </button>
+          <button
+            className={`tab-btn ${activeTab === 'analytics' ? 'active' : ''}`}
+            onClick={() => switchTab('analytics')}
+          >
+            Analytics
+          </button>
+        </nav>
       </header>
 
+      {activeTab === 'transcribe' && (
+      <>
       <section className="section">
         <h2 className="section-title">
           Select Audio Files
@@ -656,6 +810,16 @@ const removeChunk = useCallback((index) => {
               Browse
             </button>
           </div>
+        </div>
+
+        <div className="record-container">
+          <button
+            className={`record-btn ${isRecording ? 'recording' : ''}`}
+            onClick={isRecording ? stopRecording : startRecording}
+          >
+            {isRecording ? '⏹ Stop Recording' : '🎤 Record from Microphone'}
+          </button>
+          {isRecording && <span className="recording-indicator">Recording...</span>}
         </div>
 
         {selectedFiles.length > 1 && (
@@ -1091,10 +1255,12 @@ const removeChunk = useCallback((index) => {
           )}
         </section>
       )}
+      </>
+      )}
 
-      {showLogs && (
+      {activeTab === 'history' && (
         <section className="logs-container">
-          <h2 className="section-title">Transcription Logs</h2>
+          <h2 className="section-title">History</h2>
           <table className="logs-table">
             <thead>
               <tr>
@@ -1102,25 +1268,85 @@ const removeChunk = useCallback((index) => {
                 <th>Date</th>
                 <th>File</th>
                 <th>Duration</th>
+                <th>Size</th>
                 <th>Run Time</th>
                 <th>Chunks</th>
+                <th>Cores</th>
                 <th>Model</th>
+                <th></th>
               </tr>
             </thead>
             <tbody>
               {logs.map((log) => (
                 <tr key={log.number}>
                   <td>{log.number}</td>
-                  <td>{log.date} {log.time}</td>
+                  <td>{log.date}</td>
                   <td>{log.file_name}</td>
-                  <td>{log.duration}s</td>
-                  <td>{log.run_time}s</td>
+                  <td>{log.duration}</td>
+                  <td>{log.file_size}</td>
+                  <td>{log.run_time}</td>
                   <td>{log.num_chunks}</td>
+                  <td>{log.cpu_cores}</td>
                   <td>{log.model || '-'}</td>
+                  <td>
+                    <button className="delete-log-btn" onClick={() => deleteLog(log.number)} title="Delete">×</button>
+                  </td>
                 </tr>
               ))}
             </tbody>
           </table>
+          {logs.length === 0 && (
+            <div className="empty-state">No history yet.</div>
+          )}
+        </section>
+      )}
+
+      {activeTab === 'analytics' && (
+        <section className="logs-container">
+          <h2 className="section-title">Analytics</h2>
+          <div className="analytics-grid">
+            <div className="analytics-card">
+              <div className="analytics-value">{analytics?.total_files ?? '-'}</div>
+              <div className="analytics-label">Processed Files</div>
+            </div>
+            <div className="analytics-card">
+              <div className="analytics-value">{analytics?.total_duration_formatted ?? '-'}</div>
+              <div className="analytics-label">Total Processed Time</div>
+            </div>
+            <div className="analytics-card">
+              <div className="analytics-value">{analytics?.avg_runtime_formatted ?? '-'}</div>
+              <div className="analytics-label">Average Run Time</div>
+            </div>
+            <div className="analytics-card">
+              <div className="analytics-value">{analytics?.median_runtime_formatted ?? '-'}</div>
+              <div className="analytics-label">Median Run Time</div>
+            </div>
+            <div className="analytics-card">
+              <div className="analytics-value">{analytics?.avg_duration_formatted ?? '-'}</div>
+              <div className="analytics-label">Average File Length</div>
+            </div>
+            <div className="analytics-card">
+              <div className="analytics-value">{analytics?.median_duration_formatted ?? '-'}</div>
+              <div className="analytics-label">Median File Length</div>
+            </div>
+          </div>
+
+          {analytics && (
+            <>
+              <BarChart
+                title="Number of Runs by CPU Cores"
+                data={analytics.runs_by_cores}
+                unit=" runs"
+                valueFormatter={(v) => v}
+              />
+              <BarChart
+                title="Avg Run Time per 1 min of Audio (s) by CPU Cores"
+                data={analytics.avg_per_min_by_cores}
+                unit=" s"
+                valueFormatter={(v) => v}
+              />
+            </>
+          )}
         </section>
       )}
 
